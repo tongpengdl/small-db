@@ -65,12 +65,12 @@ MODULE.bazel.lock
 /.gomodcache/
 /.gopath/
 
+# Local built binaries
+/small_db_example
+
 # VS Code
 .vscode/
 *.code-workspace
 
 # db files
-log.wal
-
-# binary files
-small_db_example
+/data/

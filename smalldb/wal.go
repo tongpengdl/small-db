@@ -5,14 +5,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
-	"path/filepath"
 )
 
 const (
-	walFileName = "log.wal"
-
 	opSet    byte = 1
 	opDelete byte = 2
 )
@@ -21,18 +19,19 @@ const (
 //
 // Record format (LittleEndian):
 //   - uint32 payload length
-//   - byte op
-//   - uint32 key length
-//   - uint32 value length
-//   - key bytes
-//   - value bytes
+//   - payload bytes:
+//       - byte op
+//       - uint32 key length
+//       - uint32 value length
+//       - key bytes
+//       - value bytes
+//   - uint32 crc32c(payload)   (crc32.ChecksumIEEE for now)
 type wal struct {
 	f *os.File
 }
 
 // openWAL opens the WAL file for append-only writes, creating it if missing.
-func openWAL(dir string) (*wal, error) {
-	path := filepath.Join(dir, walFileName)
+func openWAL(path string) (*wal, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("open wal: %w", err)
@@ -65,20 +64,18 @@ func (w *wal) appendRecord(op byte, key string, value []byte) error {
 	if w == nil || w.f == nil {
 		return errors.New("wal is closed")
 	}
-	keyBytes := []byte(key)
-	// 1 byte op + 4 bytes key length + 4 bytes value length + key + value
-	payloadLen := uint32(1 + 4 + 4 + len(keyBytes) + len(value))
+
+	payload := encodeWALPayload(op, key, value)
+	payloadLen := uint32(len(payload))
+	crc := crc32.ChecksumIEEE(payload)
 
 	var buf bytes.Buffer
-	buf.Grow(int(4 + payloadLen))
+	buf.Grow(int(4 + payloadLen + 4))
 	_ = binary.Write(&buf, binary.LittleEndian, payloadLen)
-	_ = buf.WriteByte(op)
-	_ = binary.Write(&buf, binary.LittleEndian, uint32(len(keyBytes)))
-	_ = binary.Write(&buf, binary.LittleEndian, uint32(len(value)))
-	_, _ = buf.Write(keyBytes)
-	_, _ = buf.Write(value)
+	_, _ = buf.Write(payload)
+	_ = binary.Write(&buf, binary.LittleEndian, crc)
 
-	if _, err := w.f.Write(buf.Bytes()); err != nil {
+	if err := writeAll(w.f, buf.Bytes()); err != nil {
 		return fmt.Errorf("write wal: %w", err)
 	}
 	if err := w.f.Sync(); err != nil {
@@ -97,8 +94,7 @@ type walRecord struct {
 //
 // If the file ends with a partial record (e.g., a crash during append), the
 // trailing fragment is ignored.
-func replayWAL(dir string, apply func(walRecord) error) error {
-	path := filepath.Join(dir, walFileName)
+func replayWAL(path string, apply func(walRecord) error) error {
 	f, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -150,7 +146,22 @@ func replayWAL(dir string, apply func(walRecord) error) error {
 			return fmt.Errorf("read wal payload: %w", err)
 		}
 
-		rec, err := decodeWALRecord(payload)
+		var crcBuf [4]byte
+		_, err = io.ReadFull(f, crcBuf[:])
+		if err != nil {
+			if errors.Is(err, io.ErrUnexpectedEOF) {
+				return nil
+			}
+			return fmt.Errorf("read wal crc: %w", err)
+		}
+
+		wantCRC := binary.LittleEndian.Uint32(crcBuf[:])
+		gotCRC := crc32.ChecksumIEEE(payload)
+		if gotCRC != wantCRC {
+			return fmt.Errorf("wal crc mismatch: want=%08x got=%08x", wantCRC, gotCRC)
+		}
+
+		rec, err := decodeWALPayload(payload)
 		if err != nil {
 			return err
 		}
@@ -160,8 +171,23 @@ func replayWAL(dir string, apply func(walRecord) error) error {
 	}
 }
 
-// decodeWALRecord validates and decodes a single WAL payload (without the length prefix).
-func decodeWALRecord(payload []byte) (walRecord, error) {
+func encodeWALPayload(op byte, key string, value []byte) []byte {
+	keyBytes := []byte(key)
+	// 1 byte op + 4 bytes key length + 4 bytes value length + key + value
+	payloadLen := 1 + 4 + 4 + len(keyBytes) + len(value)
+
+	var buf bytes.Buffer
+	buf.Grow(payloadLen)
+	_ = buf.WriteByte(op)
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(len(keyBytes)))
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(len(value)))
+	_, _ = buf.Write(keyBytes)
+	_, _ = buf.Write(value)
+	return buf.Bytes()
+}
+
+// decodeWALPayload validates and decodes a single WAL payload.
+func decodeWALPayload(payload []byte) (walRecord, error) {
 	if len(payload) < 1+4+4 {
 		return walRecord{}, fmt.Errorf("wal payload too short: %d", len(payload))
 	}
@@ -188,4 +214,15 @@ func decodeWALRecord(payload []byte) (walRecord, error) {
 	}
 
 	return walRecord{op: op, key: key, value: value}, nil
+}
+
+func writeAll(f *os.File, data []byte) error {
+	for len(data) > 0 {
+		n, err := f.Write(data)
+		if err != nil {
+			return err
+		}
+		data = data[n:]
+	}
+	return nil
 }

@@ -37,12 +37,20 @@ func Open(opts Options) (*DB, error) {
 		return nil, err
 	}
 
+	version, err := resolveActiveVersion(opts.Dir)
+	if err != nil {
+		return nil, err
+	}
+	if err := writeVersionFileIfMissing(opts.Dir, version); err != nil {
+		return nil, err
+	}
+
 	db := &DB{
 		dir:   opts.Dir,
 		state: make(map[string][]byte),
 	}
 
-	if err := replayWAL(opts.Dir, func(r walRecord) error {
+	if err := replayWAL(logPath(opts.Dir, version), func(r walRecord) error {
 		switch r.op {
 		case opSet:
 			// Copy value so the backing slice isn't reused.
@@ -60,7 +68,7 @@ func Open(opts Options) (*DB, error) {
 		return nil, err
 	}
 
-	w, err := openWAL(opts.Dir)
+	w, err := openWAL(logPath(opts.Dir, version))
 	if err != nil {
 		return nil, err
 	}

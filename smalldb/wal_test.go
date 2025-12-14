@@ -4,14 +4,14 @@ import (
 	"bytes"
 	"encoding/binary"
 	"os"
-	"path/filepath"
 	"testing"
 )
 
 func TestReplayWAL_RoundTrip(t *testing.T) {
 	dir := t.TempDir()
+	path := logPath(dir, 0)
 
-	w, err := openWAL(dir)
+	w, err := openWAL(path)
 	if err != nil {
 		t.Fatalf("openWAL: %v", err)
 	}
@@ -29,7 +29,7 @@ func TestReplayWAL_RoundTrip(t *testing.T) {
 	}
 
 	state := make(map[string][]byte)
-	if err := replayWAL(dir, func(r walRecord) error {
+	if err := replayWAL(path, func(r walRecord) error {
 		switch r.op {
 		case opSet:
 			v := make([]byte, len(r.value))
@@ -55,8 +55,9 @@ func TestReplayWAL_RoundTrip(t *testing.T) {
 
 func TestReplayWAL_IgnoresTrailingPartialRecord(t *testing.T) {
 	dir := t.TempDir()
+	path := logPath(dir, 0)
 
-	w, err := openWAL(dir)
+	w, err := openWAL(path)
 	if err != nil {
 		t.Fatalf("openWAL: %v", err)
 	}
@@ -68,7 +69,6 @@ func TestReplayWAL_IgnoresTrailingPartialRecord(t *testing.T) {
 	}
 
 	// Append an incomplete record: length prefix says 10 bytes, but we only write 2.
-	path := filepath.Join(dir, walFileName)
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
 	if err != nil {
 		t.Fatalf("open wal file for append: %v", err)
@@ -85,7 +85,7 @@ func TestReplayWAL_IgnoresTrailingPartialRecord(t *testing.T) {
 
 	var got walRecord
 	var gotCount int
-	if err := replayWAL(dir, func(r walRecord) error {
+	if err := replayWAL(path, func(r walRecord) error {
 		got = r
 		gotCount++
 		return nil
@@ -103,13 +103,33 @@ func TestReplayWAL_IgnoresTrailingPartialRecord(t *testing.T) {
 
 func TestReplayWAL_InvalidLengthErrors(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, walFileName)
+	path := logPath(dir, 0)
 
 	// payloadLen == 0 is rejected.
 	if err := os.WriteFile(path, []byte{0, 0, 0, 0}, 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	if err := replayWAL(dir, func(walRecord) error { return nil }); err == nil {
+	if err := replayWAL(path, func(walRecord) error { return nil }); err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+}
+
+func TestReplayWAL_CRCMismatchErrors(t *testing.T) {
+	dir := t.TempDir()
+	path := logPath(dir, 0)
+
+	// Write a syntactically valid record with an invalid CRC.
+	payload := encodeWALPayload(opSet, "k", []byte("v"))
+
+	var buf bytes.Buffer
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(len(payload)))
+	_, _ = buf.Write(payload)
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(0xdeadbeef))
+
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := replayWAL(path, func(walRecord) error { return nil }); err == nil {
 		t.Fatalf("expected error, got nil")
 	}
 }

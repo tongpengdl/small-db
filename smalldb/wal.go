@@ -18,15 +18,25 @@ const (
 
 // wal implements an append-only write-ahead log used for crash recovery.
 //
-// Record format (LittleEndian):
-//   - uint32 payload length
-//   - payload bytes:
-//   - byte op
-//   - uint32 key length
-//   - uint32 value length
-//   - key bytes
-//   - value bytes
-//   - uint32 crc32c(payload)   (crc32.ChecksumIEEE for now)
+// WAL record format (LittleEndian):
+//
+//	[ uint32 payload_len ]
+//	[ payload bytes ... ]        // logical operation only
+//	[ uint32 crc32(payload) ]
+//
+// Payload layout:
+//
+//	[ byte   op ]
+//	[ uint32 key_len ]
+//	[ uint32 value_len ]
+//	[ key bytes ]
+//	[ value bytes ]
+//
+// Notes:
+//   - The CRC is computed over the payload bytes only.
+//   - The CRC is NOT part of the payload.
+//   - A torn write may leave an incomplete trailing record, which is
+//     safely ignored during replay.
 type wal struct {
 	f *os.File
 }

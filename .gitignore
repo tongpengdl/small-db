@@ -39,3 +39,38 @@
 
 # debug information files
 *.dwo
+
+# CMake / build artifacts
+/build/
+/cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+install_manifest.txt
+compile_commands.json
+.ninja_deps
+.ninja_log
+build.ninja
+rules.ninja
+Makefile
+
+# Bazel leftovers (in case you tried Bazel)
+/bazel-*
+/.bazel_output/
+MODULE.bazel.lock
+
+# Go build caches (use local caches to avoid global cache permissions issues)
+/.gocache/
+/.gomodcache/
+/.gopath/
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# db files
+log.wal
+
+# binary files
+small_db_example

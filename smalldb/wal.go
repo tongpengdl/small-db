@@ -8,6 +8,7 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"path/filepath"
 )
 
 const (
@@ -20,21 +21,40 @@ const (
 // Record format (LittleEndian):
 //   - uint32 payload length
 //   - payload bytes:
-//       - byte op
-//       - uint32 key length
-//       - uint32 value length
-//       - key bytes
-//       - value bytes
+//   - byte op
+//   - uint32 key length
+//   - uint32 value length
+//   - key bytes
+//   - value bytes
 //   - uint32 crc32c(payload)   (crc32.ChecksumIEEE for now)
 type wal struct {
 	f *os.File
 }
 
 // openWAL opens the WAL file for append-only writes, creating it if missing.
+// It prepare a WAL such that future appends are safe, durable, and correctly replayable
 func openWAL(path string) (*wal, error) {
+	_, statErr := os.Stat(path)
+	created := errors.Is(statErr, os.ErrNotExist)
+	if statErr != nil && !created {
+		return nil, fmt.Errorf("stat wal: %w", statErr)
+	}
+
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("open wal: %w", err)
+	}
+	if created {
+		// Ensure the directory entry is durable too; fsync'ing the file contents
+		// is not sufficient to guarantee the newly-created name is persisted.
+		if err := f.Sync(); err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("fsync wal after create: %w", err)
+		}
+		if err := syncDir(filepath.Dir(path)); err != nil {
+			_ = f.Close()
+			return nil, err
+		}
 	}
 	return &wal{f: f}, nil
 }

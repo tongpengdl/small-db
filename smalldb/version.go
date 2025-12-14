@@ -39,14 +39,28 @@ func resolveActiveVersion(dir string) (uint64, error) {
 // first open, so recovery can always start by reading `version`.
 func writeVersionFileIfMissing(dir string, version uint64) error {
 	path := versionPath(dir)
-	_, err := os.Stat(path)
-	if err == nil {
-		return nil
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return nil
+		}
+		return fmt.Errorf("create version file: %w", err)
 	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("stat version file: %w", err)
+
+	_, werr := f.WriteString(strconv.FormatUint(version, 10) + "\n")
+	serr := f.Sync()
+	cerr := f.Close()
+
+	if werr != nil {
+		return fmt.Errorf("write version file: %w", werr)
 	}
-	return os.WriteFile(path, []byte(strconv.FormatUint(version, 10)+"\n"), 0o644)
+	if serr != nil {
+		return fmt.Errorf("fsync version file: %w", serr)
+	}
+	if cerr != nil {
+		return fmt.Errorf("close version file: %w", cerr)
+	}
+	return syncDir(dir)
 }
 
 // readVersionIfExists reads a uint64 version number from a small text file.

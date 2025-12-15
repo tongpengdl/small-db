@@ -169,7 +169,7 @@ func (db *DB) Checkpoint() error {
 		return err
 	}
 
-	// Milestone 4 (checkpoint serialize):
+	// Checkpoint serialize:
 	// - Block writers (writeMu) but keep allowing readers.
 	// - Take a stable snapshot of the in-memory map.
 	// - Serialize snapshot to checkpoint.(N+1) via temp file + fsync + rename.
@@ -186,15 +186,12 @@ func (db *DB) Checkpoint() error {
 	db.stateMu.RUnlock()
 
 	next := db.version + 1
-	_ = snapshot
-	_ = next
-
-	// TODO(Milestone 4): Implement writeCheckpoint and call it here:
-	//   if err := writeCheckpoint(db.dir, next, snapshot); err != nil { return err }
-	//
+	if err := writeCheckpoint(db.dir, next, snapshot); err != nil {
+		return err
+	}
 	// TODO(Milestone 5): After checkpointing, rotate to logfile.(N+1) and
 	// atomically switch `version`/`newVersion` to point at N+1.
-	return errors.New("checkpoint: not implemented yet")
+	return nil
 }
 
 // Close closes the database and releases file descriptors.

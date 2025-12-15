@@ -12,7 +12,8 @@ import (
 // Reads are concurrent; writes are serialized to ensure WAL records are appended
 // (and fsync'd) before the corresponding state mutation is applied.
 type DB struct {
-	dir string
+	dir     string
+	version uint64
 
 	stateMu sync.RWMutex
 	state   map[string][]byte
@@ -46,9 +47,21 @@ func Open(opts Options) (*DB, error) {
 	}
 
 	db := &DB{
-		dir:   opts.Dir,
-		state: make(map[string][]byte),
+		dir:     opts.Dir,
+		version: version,
 	}
+
+	// Milestone 4 (checkpoint restore):
+	// 1) Load checkpoint.<version> into memory (if it exists).
+	// 2) Replay logfile.<version> on top.
+	//
+	// This preserves the paper’s recovery invariant: checkpoint + subsequent log
+	// deterministically reconstruct the latest committed state.
+	state, err := loadCheckpoint(opts.Dir, version)
+	if err != nil {
+		return nil, err
+	}
+	db.state = state
 
 	if err := replayWAL(logPath(opts.Dir, version), func(r walRecord) error {
 		switch r.op {
@@ -155,6 +168,32 @@ func (db *DB) Checkpoint() error {
 	if err := db.ensureOpen(); err != nil {
 		return err
 	}
+
+	// Milestone 4 (checkpoint serialize):
+	// - Block writers (writeMu) but keep allowing readers.
+	// - Take a stable snapshot of the in-memory map.
+	// - Serialize snapshot to checkpoint.(N+1) via temp file + fsync + rename.
+	//
+	// Note: the “version switch + log rotation” is Milestone 5. For now,
+	// checkpointing can be implemented as “write a snapshot file” without
+	// switching the active generation.
+	db.writeMu.Lock()
+	defer db.writeMu.Unlock()
+
+	// Take a consistent snapshot while allowing concurrent readers.
+	db.stateMu.RLock()
+	snapshot := cloneStateLocked(db.state)
+	db.stateMu.RUnlock()
+
+	next := db.version + 1
+	_ = snapshot
+	_ = next
+
+	// TODO(Milestone 4): Implement writeCheckpoint and call it here:
+	//   if err := writeCheckpoint(db.dir, next, snapshot); err != nil { return err }
+	//
+	// TODO(Milestone 5): After checkpointing, rotate to logfile.(N+1) and
+	// atomically switch `version`/`newVersion` to point at N+1.
 	return errors.New("checkpoint: not implemented yet")
 }
 
@@ -202,4 +241,14 @@ func ensureDir(dir string, createIfMissing bool) error {
 		return fmt.Errorf("mkdir: %w", err)
 	}
 	return nil
+}
+
+func cloneStateLocked(src map[string][]byte) map[string][]byte {
+	dst := make(map[string][]byte, len(src))
+	for k, v := range src {
+		cp := make([]byte, len(v))
+		copy(cp, v)
+		dst[k] = cp
+	}
+	return dst
 }

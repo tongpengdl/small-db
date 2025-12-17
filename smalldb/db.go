@@ -66,19 +66,7 @@ func Open(opts Options) (*DB, error) {
 	db.state = state
 
 	if err := replayWAL(logPath(opts.Dir, version), func(r walRecord) error {
-		switch r.op {
-		case opSet:
-			// Copy value so the backing slice isn't reused.
-			v := make([]byte, len(r.value))
-			copy(v, r.value)
-			db.state[r.key] = v
-			return nil
-		case opDelete:
-			delete(db.state, r.key)
-			return nil
-		default:
-			return fmt.Errorf("unknown wal op: %d", r.op)
-		}
+		return applyRecord(db.state, r)
 	}); err != nil {
 		return nil, err
 	}
@@ -133,11 +121,7 @@ func (db *DB) Set(key string, value []byte) error {
 
 	db.stateMu.Lock()
 	defer db.stateMu.Unlock()
-
-	v := make([]byte, len(value))
-	copy(v, value)
-	db.state[key] = v
-	return nil
+	return applyRecord(db.state, walRecord{op: opSet, key: key, value: value})
 }
 
 // Delete removes key if present.
@@ -161,8 +145,7 @@ func (db *DB) Delete(key string) error {
 
 	db.stateMu.Lock()
 	defer db.stateMu.Unlock()
-	delete(db.state, key)
-	return nil
+	return applyRecord(db.state, walRecord{op: opDelete, key: key})
 }
 
 // Checkpoint persists the current state in a compact form and truncates the WAL.
@@ -284,4 +267,19 @@ func cloneStateLocked(src map[string][]byte) map[string][]byte {
 		dst[k] = cp
 	}
 	return dst
+}
+
+func applyRecord(state map[string][]byte, r walRecord) error {
+	switch r.op {
+	case opSet:
+		v := make([]byte, len(r.value))
+		copy(v, r.value)
+		state[r.key] = v
+		return nil
+	case opDelete:
+		delete(state, r.key)
+		return nil
+	default:
+		return fmt.Errorf("unknown wal op: %d", r.op)
+	}
 }

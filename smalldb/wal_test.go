@@ -129,7 +129,22 @@ func TestReplayWAL_CRCMismatchErrors(t *testing.T) {
 	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	if err := replayWAL(path, func(walRecord) error { return nil }); err == nil {
-		t.Fatalf("expected error, got nil")
+	var applied int
+	if err := replayWAL(path, func(walRecord) error {
+		applied++
+		return nil
+	}); err != nil {
+		t.Fatalf("replayWAL: %v", err)
+	}
+	if applied != 0 {
+		t.Fatalf("expected 0 records applied, got %d", applied)
+	}
+
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if st.Size() != 0 {
+		t.Fatalf("expected wal to be truncated to 0, got size=%d", st.Size())
 	}
 }

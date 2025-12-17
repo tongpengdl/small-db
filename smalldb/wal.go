@@ -125,7 +125,7 @@ type walRecord struct {
 // If the file ends with a partial record (e.g., a crash during append), the
 // trailing fragment is ignored.
 func replayWAL(path string, apply func(walRecord) error) error {
-	f, err := os.Open(path)
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
@@ -151,12 +151,20 @@ func replayWAL(path string, apply func(walRecord) error) error {
 	// replay all fully-written records while tolerating a torn or incomplete
 	// record at the end of the file.
 	for {
-		_, err := io.ReadFull(f, lenBuf[:])
+		recordStart, err := f.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return fmt.Errorf("seek wal: %w", err)
+		}
+
+		_, err = io.ReadFull(f, lenBuf[:])
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
 			if errors.Is(err, io.ErrUnexpectedEOF) {
+				// Partial trailing record.
+				_ = f.Truncate(recordStart)
+				_ = f.Sync()
 				return nil
 			}
 			return fmt.Errorf("read wal length: %w", err)
@@ -171,6 +179,9 @@ func replayWAL(path string, apply func(walRecord) error) error {
 		_, err = io.ReadFull(f, payload)
 		if err != nil {
 			if errors.Is(err, io.ErrUnexpectedEOF) {
+				// Partial trailing record.
+				_ = f.Truncate(recordStart)
+				_ = f.Sync()
 				return nil
 			}
 			return fmt.Errorf("read wal payload: %w", err)
@@ -180,6 +191,9 @@ func replayWAL(path string, apply func(walRecord) error) error {
 		_, err = io.ReadFull(f, crcBuf[:])
 		if err != nil {
 			if errors.Is(err, io.ErrUnexpectedEOF) {
+				// Partial trailing record.
+				_ = f.Truncate(recordStart)
+				_ = f.Sync()
 				return nil
 			}
 			return fmt.Errorf("read wal crc: %w", err)
@@ -188,7 +202,15 @@ func replayWAL(path string, apply func(walRecord) error) error {
 		wantCRC := binary.LittleEndian.Uint32(crcBuf[:])
 		gotCRC := crc32.ChecksumIEEE(payload)
 		if gotCRC != wantCRC {
-			return fmt.Errorf("wal crc mismatch: want=%08x got=%08x", wantCRC, gotCRC)
+			// Stop replay at the first corrupted record. This preserves the
+			// "prefix property": all earlier records were fully written and verified,
+			// so the state remains correct up to the last good record.
+			//
+			// Best-effort truncate drops the corrupted record and any trailing bytes
+			// so subsequent opens don't repeatedly hit the same mismatch.
+			_ = f.Truncate(recordStart)
+			_ = f.Sync()
+			return nil
 		}
 
 		rec, err := decodeWALPayload(payload)

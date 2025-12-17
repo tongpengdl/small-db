@@ -111,19 +111,43 @@ func recoverAndCleanupVersionSwitch(dir string) (uint64, error) {
 		return 0, fmt.Errorf("remove newVersion temp: %w", err)
 	}
 
-	gen, err := resolveActiveVersion(dir)
+	current, ok, err := readVersionIfExists(versionPath(dir))
 	if err != nil {
 		return 0, err
 	}
+	if !ok {
+		current = 0
+	}
 
-	// If newVersion exists, it means we committed to a new version but might have
-	// crashed before finalizing the rename. Complete the switch now.
-	if _, err := os.Stat(newVersionPath(dir)); err == nil {
-		if err := finalizeVersionSwitch(dir); err != nil {
-			return 0, fmt.Errorf("finalize pending version switch: %w", err)
+	// If newVersion exists and is valid, prefer it and finalize the rename.
+	// Otherwise remove it and fall back to `version`.
+	if pending, ok, err := readVersionIfExists(newVersionPath(dir)); err != nil {
+		// Can't parse newVersion: treat as invalid and remove it.
+		if rmErr := os.Remove(newVersionPath(dir)); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			return 0, fmt.Errorf("remove invalid newVersion: %w", rmErr)
 		}
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return 0, fmt.Errorf("stat newVersion: %w", err)
+		_ = syncDir(dir)
+	} else if ok {
+		if _, err := os.Stat(checkpointPath(dir, pending)); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				_ = os.Remove(newVersionPath(dir))
+				_ = syncDir(dir)
+			} else {
+				return 0, fmt.Errorf("stat checkpoint for newVersion: %w", err)
+			}
+		} else if _, err := os.Stat(logPath(dir, pending)); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				_ = os.Remove(newVersionPath(dir))
+				_ = syncDir(dir)
+			} else {
+				return 0, fmt.Errorf("stat logfile for newVersion: %w", err)
+			}
+		} else {
+			if err := finalizeVersionSwitch(dir); err != nil {
+				return 0, fmt.Errorf("finalize pending version switch: %w", err)
+			}
+			current = pending
+		}
 	}
 
 	// Cleanup redundant files from non-active generations.
@@ -133,9 +157,9 @@ func recoverAndCleanupVersionSwitch(dir string) (uint64, error) {
 	// - older checkpoint/log files that were supposed to be deleted, or
 	// - newer checkpoint/log files created before the commit point (newVersion).
 	//
-	// Since `gen` represents the active generation, we can remove checkpoint/log
+	// Since `current` represents the active generation, we can remove checkpoint/log
 	// files for other generations to get back to the canonical "one pair on disk"
-	// layout: checkpoint.gen + logfile.gen.
+	// layout: checkpoint.current + logfile.current.
 	entries, err := listDir(dir)
 	if err != nil {
 		return 0, err
@@ -154,14 +178,14 @@ func recoverAndCleanupVersionSwitch(dir string) (uint64, error) {
 			continue
 		}
 
-		if v, ok := parseVersionFilename("checkpoint", name); ok && v != gen {
+		if v, ok := parseVersionFilename("checkpoint", name); ok && v != current {
 			if err := os.Remove(filepath.Join(dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return 0, fmt.Errorf("remove checkpoint: %w", err)
 			}
 			removedAny = true
 			continue
 		}
-		if v, ok := parseVersionFilename("logfile", name); ok && v != gen {
+		if v, ok := parseVersionFilename("logfile", name); ok && v != current {
 			if err := os.Remove(filepath.Join(dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return 0, fmt.Errorf("remove logfile: %w", err)
 			}
@@ -175,7 +199,7 @@ func recoverAndCleanupVersionSwitch(dir string) (uint64, error) {
 		}
 	}
 
-	return gen, nil
+	return current, nil
 }
 
 func newVersionTempPath(dir string) string {

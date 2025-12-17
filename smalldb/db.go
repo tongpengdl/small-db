@@ -38,7 +38,9 @@ func Open(opts Options) (*DB, error) {
 		return nil, err
 	}
 
-	version, err := resolveActiveVersion(opts.Dir)
+	// Version switch recovery: finalizes any pending switch and prunes stale
+	// generations so the directory has a single active (checkpoint, log) pair.
+	version, err := recoverAndCleanupVersionSwitch(opts.Dir)
 	if err != nil {
 		return nil, err
 	}
@@ -51,11 +53,11 @@ func Open(opts Options) (*DB, error) {
 		version: version,
 	}
 
-	// Milestone 4 (checkpoint restore):
-	// 1) Load checkpoint.<version> into memory (if it exists).
-	// 2) Replay logfile.<version> on top.
+	// Recovery:
+	// - Load checkpoint.<version> into memory (if it exists).
+	// - Replay logfile.<version> on top.
 	//
-	// This preserves the paper’s recovery invariant: checkpoint + subsequent log
+	// This preserves the core invariant: checkpoint + subsequent log
 	// deterministically reconstruct the latest committed state.
 	state, err := loadCheckpoint(opts.Dir, version)
 	if err != nil {
@@ -169,14 +171,12 @@ func (db *DB) Checkpoint() error {
 		return err
 	}
 
-	// Checkpoint serialize:
+	// Checkpoint protocol:
 	// - Block writers (writeMu) but keep allowing readers.
 	// - Take a stable snapshot of the in-memory map.
-	// - Serialize snapshot to checkpoint.(N+1) via temp file + fsync + rename.
-	//
-	// Note: the “version switch + log rotation” is Milestone 5. For now,
-	// checkpointing can be implemented as “write a snapshot file” without
-	// switching the active generation.
+	// - Write checkpoint.(N+1) via temp file + fsync + rename.
+	// - Create logfile.(N+1).
+	// - Publish newVersion (commit point), then finalize the switch and rotate WAL.
 	db.writeMu.Lock()
 	defer db.writeMu.Unlock()
 
@@ -189,8 +189,44 @@ func (db *DB) Checkpoint() error {
 	if err := writeCheckpoint(db.dir, next, snapshot); err != nil {
 		return err
 	}
-	// TODO(Milestone 5): After checkpointing, rotate to logfile.(N+1) and
-	// atomically switch `version`/`newVersion` to point at N+1.
+
+	// After writing the checkpoint (N+1), perform the version switch steps:
+	// 1) Create empty logfile.(N+1)
+	if err := createEmptyLogFile(db.dir, next); err != nil {
+		_ = os.Remove(checkpointPath(db.dir, next))
+		return fmt.Errorf("create next log file: %w", err)
+	}
+
+	// 2) Write newVersion containing (N+1) and fsync it (commit point)
+	if err := writeNewVersionFile(db.dir, next); err != nil {
+		// Not committed: safe to remove the unreferenced new generation files.
+		_ = os.Remove(checkpointPath(db.dir, next))
+		_ = os.Remove(logPath(db.dir, next))
+		_ = os.Remove(newVersionTempPath(db.dir))
+		return fmt.Errorf("write new version file: %w", err)
+	}
+
+	// 3) Delete old checkpoint.N, logfile.N
+	if err := cleanupOldGenerationFiles(db.dir, db.version); err != nil {
+		return fmt.Errorf("cleanup old files: %w", err)
+	}
+
+	// 4) Rename newVersion -> version and fsync directory
+	if err := finalizeVersionSwitch(db.dir); err != nil {
+		return fmt.Errorf("finalize version switch: %w", err)
+	}
+
+	// 5) Update in-memory pointers:
+	if err := db.wal.close(); err != nil {
+		return fmt.Errorf("close old wal: %w", err)
+	}
+	newWal, err := openWAL(logPath(db.dir, next))
+	if err != nil {
+		return fmt.Errorf("open new wal: %w", err)
+	}
+	db.wal = newWal
+	db.version = next
+
 	return nil
 }
 

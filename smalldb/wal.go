@@ -79,20 +79,23 @@ func (w *wal) close() error {
 	return err
 }
 
-// appendSet appends a durable "set" record to the WAL.
-func (w *wal) appendSet(key string, value []byte) error {
+// appendSet appends a durable "set" record to the WAL and returns the number of
+// bytes appended to the file.
+func (w *wal) appendSet(key string, value []byte) (int, error) {
 	return w.appendRecord(opSet, key, value)
 }
 
-// appendDelete appends a durable "delete" record to the WAL.
-func (w *wal) appendDelete(key string) error {
+// appendDelete appends a durable "delete" record to the WAL and returns the
+// number of bytes appended to the file.
+func (w *wal) appendDelete(key string) (int, error) {
 	return w.appendRecord(opDelete, key, nil)
 }
 
 // appendRecord serializes a single record, writes it to disk, and fsyncs.
-func (w *wal) appendRecord(op byte, key string, value []byte) error {
+// It returns the number of bytes appended to the file.
+func (w *wal) appendRecord(op byte, key string, value []byte) (int, error) {
 	if w == nil || w.f == nil {
-		return errors.New("wal is closed")
+		return 0, errors.New("wal is closed")
 	}
 
 	payload := encodeWALPayload(op, key, value)
@@ -104,14 +107,15 @@ func (w *wal) appendRecord(op byte, key string, value []byte) error {
 	_ = binary.Write(&buf, binary.LittleEndian, payloadLen)
 	_, _ = buf.Write(payload)
 	_ = binary.Write(&buf, binary.LittleEndian, crc)
+	recordBytes := buf.Bytes()
 
-	if err := writeAll(w.f, buf.Bytes()); err != nil {
-		return fmt.Errorf("write wal: %w", err)
+	if err := writeAll(w.f, recordBytes); err != nil {
+		return 0, fmt.Errorf("write wal: %w", err)
 	}
 	if err := w.f.Sync(); err != nil {
-		return fmt.Errorf("fsync wal: %w", err)
+		return 0, fmt.Errorf("fsync wal: %w", err)
 	}
-	return nil
+	return len(recordBytes), nil
 }
 
 type walRecord struct {

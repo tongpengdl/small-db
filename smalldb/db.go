@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // DB is a simple in-memory key/value store backed by a write-ahead log (WAL).
@@ -14,6 +16,7 @@ import (
 type DB struct {
 	dir     string
 	version uint64
+	policy  checkpointPolicy
 
 	stateMu sync.RWMutex
 	state   map[string][]byte
@@ -24,6 +27,15 @@ type DB struct {
 
 	wal    *wal
 	closed bool
+
+	lastCheckpointUnixNano atomic.Int64
+	updatesSinceCheckpoint atomic.Uint64
+	walBytes               atomic.Int64
+
+	bgStop     chan struct{}
+	bgDone     chan struct{}
+	bgWake     chan struct{}
+	bgStopOnce sync.Once
 }
 
 // Open opens (or creates) a database at opts.Dir.
@@ -51,6 +63,7 @@ func Open(opts Options) (*DB, error) {
 	db := &DB{
 		dir:     opts.Dir,
 		version: version,
+		policy:  policyFromOptions(opts),
 	}
 
 	// Recovery:
@@ -76,6 +89,14 @@ func Open(opts Options) (*DB, error) {
 		return nil, err
 	}
 	db.wal = w
+
+	if st, err := db.wal.f.Stat(); err == nil {
+		db.walBytes.Store(st.Size())
+	}
+	db.lastCheckpointUnixNano.Store(time.Now().UnixNano())
+
+	db.startBackgroundCheckpointing()
+
 	return db, nil
 }
 
@@ -115,13 +136,18 @@ func (db *DB) Set(key string, value []byte) error {
 		return errors.New("key is empty")
 	}
 
-	if err := db.wal.appendSet(key, value); err != nil {
+	n, err := db.wal.appendSet(key, value)
+	if err != nil {
 		return err
 	}
 
 	db.stateMu.Lock()
 	defer db.stateMu.Unlock()
-	return applyRecord(db.state, walRecord{op: opSet, key: key, value: value})
+	if err := applyRecord(db.state, walRecord{op: opSet, key: key, value: value}); err != nil {
+		return err
+	}
+	db.noteCommittedUpdate(int64(n))
+	return nil
 }
 
 // Delete removes key if present.
@@ -139,13 +165,18 @@ func (db *DB) Delete(key string) error {
 		return errors.New("key is empty")
 	}
 
-	if err := db.wal.appendDelete(key); err != nil {
+	n, err := db.wal.appendDelete(key)
+	if err != nil {
 		return err
 	}
 
 	db.stateMu.Lock()
 	defer db.stateMu.Unlock()
-	return applyRecord(db.state, walRecord{op: opDelete, key: key})
+	if err := applyRecord(db.state, walRecord{op: opDelete, key: key}); err != nil {
+		return err
+	}
+	db.noteCommittedUpdate(int64(n))
+	return nil
 }
 
 // Checkpoint persists the current state in a compact form and truncates the WAL.
@@ -153,15 +184,18 @@ func (db *DB) Checkpoint() error {
 	if err := db.ensureOpen(); err != nil {
 		return err
 	}
+	db.writeMu.Lock()
+	defer db.writeMu.Unlock()
+	return db.checkpointLocked()
+}
 
+func (db *DB) checkpointLocked() error {
 	// Checkpoint protocol:
 	// - Block writers (writeMu) but keep allowing readers.
 	// - Take a stable snapshot of the in-memory map.
 	// - Write checkpoint.(N+1) via temp file + fsync + rename.
 	// - Create logfile.(N+1).
 	// - Publish newVersion (commit point), then finalize the switch and rotate WAL.
-	db.writeMu.Lock()
-	defer db.writeMu.Unlock()
 
 	// Take a consistent snapshot while allowing concurrent readers.
 	db.stateMu.RLock()
@@ -209,6 +243,9 @@ func (db *DB) Checkpoint() error {
 	}
 	db.wal = newWal
 	db.version = next
+	db.updatesSinceCheckpoint.Store(0)
+	db.walBytes.Store(0)
+	db.lastCheckpointUnixNano.Store(time.Now().UnixNano())
 
 	return nil
 }
@@ -217,6 +254,7 @@ func (db *DB) Checkpoint() error {
 //
 // Close is safe to call multiple times.
 func (db *DB) Close() error {
+	db.stopBackgroundCheckpointing()
 	db.writeMu.Lock()
 	defer db.writeMu.Unlock()
 	if db.closed {
@@ -281,5 +319,84 @@ func applyRecord(state map[string][]byte, r walRecord) error {
 		return nil
 	default:
 		return fmt.Errorf("unknown wal op: %d", r.op)
+	}
+}
+
+func (db *DB) startBackgroundCheckpointing() {
+	if !db.policy.enabled {
+		return
+	}
+	db.bgStop = make(chan struct{})
+	db.bgDone = make(chan struct{})
+	db.bgWake = make(chan struct{}, 1)
+	go db.backgroundCheckpointLoop()
+}
+
+func (db *DB) stopBackgroundCheckpointing() {
+	if db.bgStop == nil {
+		return
+	}
+	db.bgStopOnce.Do(func() { close(db.bgStop) })
+	<-db.bgDone
+}
+
+func (db *DB) backgroundCheckpointLoop() {
+	defer close(db.bgDone)
+
+	ticker := time.NewTicker(db.policy.checkEvery)
+	defer ticker.Stop()
+
+	lastAttempt := time.Time{}
+	for {
+		select {
+		case <-db.bgStop:
+			return
+		case <-ticker.C:
+		case <-db.bgWake:
+		}
+
+		if !db.shouldCheckpointNow(time.Now()) {
+			continue
+		}
+		if !lastAttempt.IsZero() && time.Since(lastAttempt) < db.policy.minRetryBack {
+			continue
+		}
+		lastAttempt = time.Now()
+
+		// Best-effort: if checkpoint fails, we retry later.
+		//
+		// Avoid blocking shutdown by only checkpointing when we can acquire the
+		// writer lock without waiting.
+		if !db.writeMu.TryLock() {
+			continue
+		}
+		_ = db.checkpointLocked()
+		db.writeMu.Unlock()
+	}
+}
+
+func (db *DB) shouldCheckpointNow(now time.Time) bool {
+	last := time.Unix(0, db.lastCheckpointUnixNano.Load())
+	if db.policy.interval > 0 && now.Sub(last) >= db.policy.interval {
+		return true
+	}
+	if db.policy.maxUpdates > 0 && db.updatesSinceCheckpoint.Load() >= db.policy.maxUpdates {
+		return true
+	}
+	if db.policy.maxLogBytes > 0 && db.walBytes.Load() >= db.policy.maxLogBytes {
+		return true
+	}
+	return false
+}
+
+func (db *DB) noteCommittedUpdate(walBytes int64) {
+	db.updatesSinceCheckpoint.Add(1)
+	db.walBytes.Add(walBytes)
+
+	if db.bgWake != nil && db.shouldCheckpointNow(time.Now()) {
+		select {
+		case db.bgWake <- struct{}{}:
+		default:
+		}
 	}
 }

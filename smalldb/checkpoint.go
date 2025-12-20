@@ -9,25 +9,9 @@ import (
 	"os"
 )
 
-// Checkpoint format
-//
-// Goal:
-// - Persist a full, consistent snapshot of the in-memory state to
-//   `checkpoint.N` (where N is a generation/version number).
-// - On startup, load `checkpoint.N` to seed memory, then replay `logfile.N`.
-//
-// Recommended structure:
-// - A small fixed-size header with a magic string and a format version.
-// - Then the serialized key/value data (gob is fine to start).
-// - Optionally a checksum to detect corruption.
-//
-// Suggested header fields (example):
-//   magic:    []byte("SMALLDB\000")
-//   version:  uint32
-//   checksum: uint32 (or uint64) of the serialized payload
-//
-// NOTE: Only the "where to put code" scaffolding is provided here. The actual
-// serialization and I/O protocol is left for you to implement.
+// Checkpoint format:
+// - magic string, format version, and generation.
+// - entry count, then repeated key length, value length, key bytes, value bytes.
 
 const checkpointMagic = "SMALLDB\x00"
 

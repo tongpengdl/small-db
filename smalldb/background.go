@@ -18,8 +18,7 @@ func policyFromOptions(opts Options) checkpointPolicy {
 		return checkpointPolicy{}
 	}
 
-	// Defaults based on the "good starting policy" in the milestone:
-	// checkpoint when log > 64MB or every 30–60 seconds.
+	// Defaults: checkpoint when log > 64MB or every 60 seconds.
 	interval := opts.CheckpointInterval
 	if interval == 0 {
 		interval = 60 * time.Second

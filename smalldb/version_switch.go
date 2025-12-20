@@ -9,9 +9,9 @@ import (
 	"strings"
 )
 
-// Milestone 5 — Version switch (paper-style)
+// Version switch (paper-style).
 //
-// The paper’s core idea is a tiny "filesystem transaction" to atomically
+// The paper's core idea is a tiny "filesystem transaction" to atomically
 // publish a new (checkpoint, log) pair:
 //
 // When making a new checkpoint from generation N:
@@ -31,10 +31,9 @@ import (
 //
 // This is the commit point of the version switch, so it must be durable.
 //
-// Implementation note:
 // We write to `newVersion.tmp` first, fsync it, then atomically rename to
-// `newVersion` and fsync the directory. This avoids leaving behind a partially
-// written-but-parseable `newVersion` file if we crash mid-write.
+// `newVersion` and fsync the directory to avoid leaving behind a partially
+// written `newVersion` file if we crash mid-write.
 func writeNewVersionFile(dir string, generation uint64) error {
 	finalPath := newVersionPath(dir)
 	if v, ok, err := readVersionIfExists(finalPath); err != nil {

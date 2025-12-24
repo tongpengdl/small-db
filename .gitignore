@@ -71,6 +71,7 @@ MODULE.bazel.lock
 # VS Code
 .vscode/
 *.code-workspace
+.gemini/
 
 # db files
 /data/

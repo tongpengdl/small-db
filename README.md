@@ -1,5 +1,14 @@
 # small-db
-A simple and efficient implementation for small databases
+A simple, durable, and efficient in-memory key/value store written in Go.
+
+## Features
+
+- **In-Memory Speed**: All data is held in memory for low-latency reads.
+- **Durability**: All writes are appended to a Write-Ahead Log (WAL) and fsync'd before acknowledgment.
+- **Group Commit**: Concurrent writes are batched into a single disk sync to improve throughput.
+- **Checkpointing**: Supports background and manual checkpointing to compact the WAL and speed up recovery.
+- **Crash Recovery**: Automatically recovers state by loading the latest checkpoint and replaying the WAL.
+- **Concurrency**: Thread-safe with support for concurrent readers and a serialized writer.
 
 ## Build (Go)
 
@@ -9,6 +18,7 @@ A simple and efficient implementation for small databases
 - Run server: `go run ./cmd/small_db_server -dir ./data -create -addr :8080`
 - Build server: `go build ./cmd/small_db_server`
 - Run tests: `go test ./...`
+- Run benchmarks: `go test -bench=. ./...`
 
 ## Data Directory Layout
 

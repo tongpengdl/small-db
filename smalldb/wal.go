@@ -79,21 +79,17 @@ func (w *wal) close() error {
 	return err
 }
 
-// appendSet appends a durable "set" record to the WAL and returns the number of
-// bytes appended to the file.
-func (w *wal) appendSet(key string, value []byte) (int, error) {
-	return w.appendRecord(opSet, key, value)
+// Sync forces a write of all buffered data to the stable storage.
+func (w *wal) Sync() error {
+	if w == nil || w.f == nil {
+		return errors.New("wal is closed")
+	}
+	return w.f.Sync()
 }
 
-// appendDelete appends a durable "delete" record to the WAL and returns the
-// number of bytes appended to the file.
-func (w *wal) appendDelete(key string) (int, error) {
-	return w.appendRecord(opDelete, key, nil)
-}
-
-// appendRecord serializes a single record, writes it to disk, and fsyncs.
-// It returns the number of bytes appended to the file.
-func (w *wal) appendRecord(op byte, key string, value []byte) (int, error) {
+// writeRecord serializes a single record and writes it to the OS buffer.
+// It does NOT fsync. Callers must call Sync() to make data durable.
+func (w *wal) writeRecord(op byte, key string, value []byte) (int, error) {
 	if w == nil || w.f == nil {
 		return 0, errors.New("wal is closed")
 	}
@@ -111,9 +107,6 @@ func (w *wal) appendRecord(op byte, key string, value []byte) (int, error) {
 
 	if err := writeAll(w.f, recordBytes); err != nil {
 		return 0, fmt.Errorf("write wal: %w", err)
-	}
-	if err := w.f.Sync(); err != nil {
-		return 0, fmt.Errorf("fsync wal: %w", err)
 	}
 	return len(recordBytes), nil
 }

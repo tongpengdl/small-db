@@ -32,10 +32,20 @@ type DB struct {
 	updatesSinceCheckpoint atomic.Uint64
 	walBytes               atomic.Int64
 
+	commitCh   chan writeRequest
+	commitDone chan struct{}
+
 	bgStop     chan struct{}
 	bgDone     chan struct{}
 	bgWake     chan struct{}
 	bgStopOnce sync.Once
+}
+
+type writeRequest struct {
+	op    byte
+	key   string
+	value []byte
+	resp  chan error
 }
 
 // Open opens (or creates) a database at opts.Dir.
@@ -61,9 +71,11 @@ func Open(opts Options) (*DB, error) {
 	}
 
 	db := &DB{
-		dir:     opts.Dir,
-		version: version,
-		policy:  policyFromOptions(opts),
+		dir:        opts.Dir,
+		version:    version,
+		policy:     policyFromOptions(opts),
+		commitCh:   make(chan writeRequest, 100),
+		commitDone: make(chan struct{}),
 	}
 
 	// Recovery:
@@ -95,6 +107,7 @@ func Open(opts Options) (*DB, error) {
 	}
 	db.lastCheckpointUnixNano.Store(time.Now().UnixNano())
 
+	go db.groupCommitLoop()
 	db.startBackgroundCheckpointing()
 
 	return db, nil
@@ -122,61 +135,154 @@ func (db *DB) Get(key string) ([]byte, bool, error) {
 
 // Set stores value at key.
 //
-// Set appends a WAL record and fsyncs it before applying the update to the
-// in-memory state. The value is copied, so callers can safely reuse the input
-// slice after Set returns.
+// Set sends a write request to the group commit loop and waits for it to be
+// persisted and applied.
 func (db *DB) Set(key string, value []byte) error {
 	if err := db.ensureOpen(); err != nil {
 		return err
 	}
-	db.writeMu.Lock()
-	defer db.writeMu.Unlock()
-
 	if key == "" {
 		return errors.New("key is empty")
 	}
 
-	n, err := db.wal.appendSet(key, value)
-	if err != nil {
-		return err
+	req := writeRequest{
+		op:    opSet,
+		key:   key,
+		value: value,
+		resp:  make(chan error, 1),
+	}
+	select {
+	case db.commitCh <- req:
+	case <-db.commitDone:
+		return errors.New("db is closed")
 	}
 
-	db.stateMu.Lock()
-	defer db.stateMu.Unlock()
-	if err := applyRecord(db.state, walRecord{op: opSet, key: key, value: value}); err != nil {
-		return err
-	}
-	db.noteCommittedUpdate(int64(n))
-	return nil
+	return <-req.resp
 }
 
 // Delete removes key if present.
 //
-// Delete appends a WAL record and fsyncs it before applying the deletion to the
-// in-memory state.
+// Delete sends a write request to the group commit loop and waits for it to be
+// persisted and applied.
 func (db *DB) Delete(key string) error {
 	if err := db.ensureOpen(); err != nil {
 		return err
 	}
-	db.writeMu.Lock()
-	defer db.writeMu.Unlock()
-
 	if key == "" {
 		return errors.New("key is empty")
 	}
 
-	n, err := db.wal.appendDelete(key)
-	if err != nil {
-		return err
+	req := writeRequest{
+		op:   opDelete,
+		key:  key,
+		resp: make(chan error, 1),
+	}
+	select {
+	case db.commitCh <- req:
+	case <-db.commitDone:
+		return errors.New("db is closed")
 	}
 
-	db.stateMu.Lock()
-	defer db.stateMu.Unlock()
-	if err := applyRecord(db.state, walRecord{op: opDelete, key: key}); err != nil {
-		return err
+	return <-req.resp
+}
+
+func (db *DB) groupCommitLoop() {
+	defer close(db.commitDone)
+
+	// Batch buffer
+	batch := make([]writeRequest, 0, 128)
+
+	for {
+		// 1. Collect a batch
+		// Block until at least one request arrives or we are stopped.
+		req, ok := <-db.commitCh
+		if !ok {
+			return
+		}
+		batch = append(batch, req)
+
+		// Opportunistically drain the channel to fill the batch.
+		// We use a small limit to ensure we don't starve latency too much,
+		// though fsync is the dominator anyway.
+	drainLoop:
+		for len(batch) < 128 {
+			select {
+			case req, ok := <-db.commitCh:
+				if !ok {
+					// Channel closed, stop draining and commit what we have.
+					break drainLoop
+				}
+				batch = append(batch, req)
+			default:
+				// No more immediate requests, proceed to commit.
+				break drainLoop
+			}
+		}
+
+		// 2. Commit the batch
+		db.commitBatch(batch)
+
+		// 3. Reset for next iteration
+		// Clear slice but keep capacity
+		for i := range batch {
+			batch[i] = writeRequest{} // avoid memory leaks
+		}
+		batch = batch[:0]
 	}
-	db.noteCommittedUpdate(int64(n))
-	return nil
+}
+
+func (db *DB) commitBatch(batch []writeRequest) {
+	// Acquire write lock to serialize against Checkpoint.
+	db.writeMu.Lock()
+	defer db.writeMu.Unlock()
+
+	// If WAL is closed (e.g. Checkpoint switched it, or Close called), ensure we are safe.
+	// But Checkpoint holds writeMu while switching, so we are safe.
+	// Only weird case: DB closed? Close() acquires writeMu too.
+	if db.closed || db.wal == nil {
+		for _, req := range batch {
+			req.resp <- errors.New("db is closed")
+		}
+		return
+	}
+
+	// 1. Write all to WAL (buffered)
+	var batchBytes int64
+	for i, req := range batch {
+		n, err := db.wal.writeRecord(req.op, req.key, req.value)
+		if err != nil {
+			// If write fails, we can't commit. Fail the whole batch?
+			// Yes, integrity is compromised if we continue.
+			failBatch(batch[i:], err)
+			return // Partial write? DB might need restart.
+		}
+		batchBytes += int64(n)
+	}
+
+	// 2. Fsync
+	if err := db.wal.Sync(); err != nil {
+		failBatch(batch, err)
+		return
+	}
+
+	// 3. Apply to state and Ack
+	// We hold writeMu, so no other writer/checkpointer can interfere.
+	// We need stateMu for map access (readers).
+	db.stateMu.Lock()
+	for _, req := range batch {
+		err := applyRecord(db.state, walRecord{op: req.op, key: req.key, value: req.value})
+		// applying strictly shouldn't fail if logic is correct
+		req.resp <- err
+	}
+	db.stateMu.Unlock()
+
+	db.noteCommittedUpdate(batchBytes)
+}
+
+func failBatch(batch []writeRequest, err error) {
+	for _, req := range batch {
+		req.resp <- err
+	}
 }
 
 // Checkpoint persists the current state in a compact form and truncates the WAL.
@@ -254,13 +360,28 @@ func (db *DB) checkpointLocked() error {
 //
 // Close is safe to call multiple times.
 func (db *DB) Close() error {
+	// 1. Stop background checkpointing
 	db.stopBackgroundCheckpointing()
+
+	// 2. Stop group commit loop
+	// We close the channel to signal the loop to exit.
+	// We need to ensure we don't close it twice.
 	db.writeMu.Lock()
-	defer db.writeMu.Unlock()
 	if db.closed {
+		db.writeMu.Unlock()
 		return nil
 	}
 	db.closed = true
+	// Close commit channel to drain and stop the loop
+	close(db.commitCh)
+	db.writeMu.Unlock()
+
+	// Wait for loop to finish
+	<-db.commitDone
+
+	// 3. Close WAL
+	db.writeMu.Lock()
+	defer db.writeMu.Unlock()
 	if db.wal != nil {
 		return db.wal.close()
 	}
@@ -269,6 +390,8 @@ func (db *DB) Close() error {
 
 // ensureOpen returns an error if the DB has been closed.
 func (db *DB) ensureOpen() error {
+	// This check is slightly racy but Set/Delete catch the closed channel.
+	// The lock in Close ensures we don't accept new work after closing.
 	if db.closed {
 		return errors.New("db is closed")
 	}

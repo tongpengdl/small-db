@@ -15,14 +15,17 @@ func TestReplayWAL_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openWAL: %v", err)
 	}
-	if _, err := w.appendSet("a", []byte("1")); err != nil {
+	if _, err := w.writeRecord(opSet, "a", []byte("1")); err != nil {
 		t.Fatalf("appendSet(a): %v", err)
 	}
-	if _, err := w.appendSet("b", []byte{0, 1, 2}); err != nil {
+	if _, err := w.writeRecord(opSet, "b", []byte{0, 1, 2}); err != nil {
 		t.Fatalf("appendSet(b): %v", err)
 	}
-	if _, err := w.appendDelete("a"); err != nil {
+	if _, err := w.writeRecord(opDelete, "a", nil); err != nil {
 		t.Fatalf("appendDelete(a): %v", err)
+	}
+	if err := w.Sync(); err != nil {
+		t.Fatalf("sync: %v", err)
 	}
 	if err := w.close(); err != nil {
 		t.Fatalf("close: %v", err)
@@ -61,8 +64,11 @@ func TestReplayWAL_IgnoresTrailingPartialRecord(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openWAL: %v", err)
 	}
-	if _, err := w.appendSet("a", []byte("1")); err != nil {
+	if _, err := w.writeRecord(opSet, "a", []byte("1")); err != nil {
 		t.Fatalf("appendSet: %v", err)
+	}
+	if err := w.Sync(); err != nil {
+		t.Fatalf("sync: %v", err)
 	}
 	if err := w.close(); err != nil {
 		t.Fatalf("close: %v", err)

@@ -3,6 +3,7 @@ package smalldb
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -27,6 +28,8 @@ type DB struct {
 
 	wal    *wal
 	closed bool
+
+	backupConn net.Conn
 
 	lastCheckpointUnixNano atomic.Int64
 	updatesSinceCheckpoint atomic.Uint64
@@ -265,6 +268,12 @@ func (db *DB) commitBatch(batch []writeRequest) {
 		return
 	}
 
+	// 2.5 Replicate to backup and wait for ACKs.
+	if err := db.replicateBatch(batch); err != nil {
+		failBatch(batch, err)
+		return
+	}
+
 	// 3. Apply to state and Ack
 	// We hold writeMu, so no other writer/checkpointer can interfere.
 	// We need stateMu for map access (readers).
@@ -382,6 +391,10 @@ func (db *DB) Close() error {
 	// 3. Close WAL
 	db.writeMu.Lock()
 	defer db.writeMu.Unlock()
+	if db.backupConn != nil {
+		_ = db.backupConn.Close()
+		db.backupConn = nil
+	}
 	if db.wal != nil {
 		return db.wal.close()
 	}

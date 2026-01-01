@@ -94,17 +94,7 @@ func (w *wal) writeRecord(op byte, key string, value []byte) (int, error) {
 		return 0, errors.New("wal is closed")
 	}
 
-	payload := encodeWALPayload(op, key, value)
-	payloadLen := uint32(len(payload))
-	crc := crc32.ChecksumIEEE(payload)
-
-	var buf bytes.Buffer
-	buf.Grow(int(4 + payloadLen + 4))
-	_ = binary.Write(&buf, binary.LittleEndian, payloadLen)
-	_, _ = buf.Write(payload)
-	_ = binary.Write(&buf, binary.LittleEndian, crc)
-	recordBytes := buf.Bytes()
-
+	recordBytes := encodeWALRecord(op, key, value)
 	if err := writeAll(w.f, recordBytes); err != nil {
 		return 0, fmt.Errorf("write wal: %w", err)
 	}
@@ -235,6 +225,18 @@ func encodeWALPayload(op byte, key string, value []byte) []byte {
 	return buf.Bytes()
 }
 
+func encodeWALRecord(op byte, key string, value []byte) []byte {
+	payload := encodeWALPayload(op, key, value)
+	payloadLen := uint32(len(payload))
+	crc := crc32.ChecksumIEEE(payload)
+
+	record := make([]byte, 4+len(payload)+4)
+	binary.LittleEndian.PutUint32(record[0:4], payloadLen)
+	copy(record[4:], payload)
+	binary.LittleEndian.PutUint32(record[4+len(payload):], crc)
+	return record
+}
+
 // decodeWALPayload validates and decodes a single WAL payload.
 func decodeWALPayload(payload []byte) (walRecord, error) {
 	if len(payload) < 1+4+4 {
@@ -265,9 +267,9 @@ func decodeWALPayload(payload []byte) (walRecord, error) {
 	return walRecord{op: op, key: key, value: value}, nil
 }
 
-func writeAll(f *os.File, data []byte) error {
+func writeAll(w io.Writer, data []byte) error {
 	for len(data) > 0 {
-		n, err := f.Write(data)
+		n, err := w.Write(data)
 		if err != nil {
 			return err
 		}

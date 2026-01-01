@@ -72,6 +72,7 @@ MODULE.bazel.lock
 .vscode/
 *.code-workspace
 .gemini/
+GEMINI.md
 
 # db files
 /data/

@@ -20,7 +20,8 @@ import (
 )
 
 type apiServer struct {
-	db *smalldb.DB
+	db       *smalldb.DB
+	readOnly bool
 }
 
 type setRequest struct {
@@ -52,6 +53,7 @@ func main() {
 		updatesFlag     = flag.Uint64("checkpoint-updates", 0, "checkpoint after N updates (0 disables)")
 		logBytesFlag    = flag.Int64("checkpoint-log-bytes", 0, "checkpoint after N WAL bytes (0 uses default)")
 		shutdownTimeout = flag.Duration("shutdown-timeout", 5*time.Second, "graceful shutdown timeout")
+		backupOfFlag    = flag.String("backup-of", "", "primary address; when set, run in backup (read-only) mode")
 	)
 	flag.Parse()
 
@@ -77,7 +79,7 @@ func main() {
 		}
 	}()
 
-	api := &apiServer{db: db}
+	api := &apiServer{db: db, readOnly: *backupOfFlag != ""}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/health", api.handleHealth)
 	mux.HandleFunc("/v1/kv/", api.handleKV)
@@ -152,6 +154,10 @@ func (s *apiServer) handleGet(w http.ResponseWriter, _ *http.Request, key string
 }
 
 func (s *apiServer) handleSet(w http.ResponseWriter, r *http.Request, key string) {
+	if s.readOnly {
+		writeError(w, http.StatusForbidden, errors.New("writes are disabled on backup"))
+		return
+	}
 	var req setRequest
 	if err := decodeJSON(r.Body, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -172,6 +178,10 @@ func (s *apiServer) handleSet(w http.ResponseWriter, r *http.Request, key string
 }
 
 func (s *apiServer) handleDelete(w http.ResponseWriter, _ *http.Request, key string) {
+	if s.readOnly {
+		writeError(w, http.StatusForbidden, errors.New("writes are disabled on backup"))
+		return
+	}
 	if err := s.db.Delete(key); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return

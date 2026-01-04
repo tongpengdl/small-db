@@ -50,6 +50,18 @@ go run ./cmd/small_db_server -dir ./data -create -addr :8080
 Keys are URL path segments (URL-encode if you need special characters). If
 `encoding` is omitted on writes, the server assumes `base64`.
 
+### Primary/Backup Replication (experimental)
+
+Backup mode connects to a primary and replays WAL records. Writes are rejected
+on the backup (read-only). Background checkpointing is disabled automatically
+for backups.
+
+Basic flow:
+
+- Start a primary normally.
+- Copy the primary data directory to the backup before starting it.
+- Start a backup with `-backup-of host:port` and a separate `-dir`.
+
 ### Examples
 
 ```

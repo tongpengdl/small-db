@@ -35,7 +35,7 @@ func (db *DB) ReceiveReplication(conn net.Conn) error {
 		rec, err := readWALRecord(conn)
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				return nil
+				return io.EOF
 			}
 			return err
 		}

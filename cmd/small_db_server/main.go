@@ -70,6 +70,9 @@ func main() {
 		CheckpointUpdates:           *updatesFlag,
 		CheckpointLogBytes:          *logBytesFlag,
 	}
+	if *backupOfFlag != "" {
+		opts.DisableBackgroundCheckpoint = true
+	}
 	db, err := smalldb.Open(opts)
 	if err != nil {
 		log.Fatalf("open db: %v", err)
@@ -96,13 +99,18 @@ func main() {
 
 	if *backupOfFlag != "" {
 		log.Printf("backup mode: replicating from %s", *backupOfFlag)
+		log.Printf("backup mode: background checkpointing disabled")
 		conn, err := net.Dial("tcp", *backupOfFlag)
 		if err != nil {
 			log.Fatalf("dial primary %s: %v", *backupOfFlag, err)
 		}
 		go func() {
 			if err := db.ReceiveReplication(conn); err != nil {
-				log.Printf("replication error: %v", err)
+				if errors.Is(err, io.EOF) {
+					log.Printf("replication stream closed")
+				} else {
+					log.Printf("replication error: %v", err)
+				}
 				stop()
 			}
 		}()
@@ -207,6 +215,10 @@ func (s *apiServer) handleDelete(w http.ResponseWriter, _ *http.Request, key str
 func (s *apiServer) handleCheckpoint(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeMethodNotAllowed(w, http.MethodPost)
+		return
+	}
+	if s.readOnly {
+		writeError(w, http.StatusForbidden, errors.New("writes are disabled on backup"))
 		return
 	}
 	if err := s.db.Checkpoint(); err != nil {

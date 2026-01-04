@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -92,6 +93,20 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	if *backupOfFlag != "" {
+		log.Printf("backup mode: replicating from %s", *backupOfFlag)
+		conn, err := net.Dial("tcp", *backupOfFlag)
+		if err != nil {
+			log.Fatalf("dial primary %s: %v", *backupOfFlag, err)
+		}
+		go func() {
+			if err := db.ReceiveReplication(conn); err != nil {
+				log.Printf("replication error: %v", err)
+				stop()
+			}
+		}()
+	}
 
 	go func() {
 		<-ctx.Done()

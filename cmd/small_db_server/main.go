@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -22,7 +23,7 @@ import (
 
 type apiServer struct {
 	db       *smalldb.DB
-	readOnly bool
+	readOnly atomic.Bool
 }
 
 type setRequest struct {
@@ -44,6 +45,10 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
+type roleResponse struct {
+	Role string `json:"role"`
+}
+
 func main() {
 	var (
 		addrFlag        = flag.String("addr", ":8080", "listen address")
@@ -62,7 +67,7 @@ func main() {
 		log.Fatal("missing required -dir")
 	}
 
-	opts := smalldb.Options{
+	baseOpts := smalldb.Options{
 		Dir:                         *dirFlag,
 		CreateIfMissing:             *createFlag,
 		DisableBackgroundCheckpoint: *disableBgFlag,
@@ -70,6 +75,8 @@ func main() {
 		CheckpointUpdates:           *updatesFlag,
 		CheckpointLogBytes:          *logBytesFlag,
 	}
+	promotionOpts := baseOpts
+	opts := baseOpts
 	if *backupOfFlag != "" {
 		opts.DisableBackgroundCheckpoint = true
 	}
@@ -83,9 +90,11 @@ func main() {
 		}
 	}()
 
-	api := &apiServer{db: db, readOnly: *backupOfFlag != ""}
+	api := &apiServer{db: db}
+	api.readOnly.Store(*backupOfFlag != "")
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/health", api.handleHealth)
+	mux.HandleFunc("/v1/role", api.handleRole)
 	mux.HandleFunc("/v1/kv/", api.handleKV)
 	mux.HandleFunc("/v1/checkpoint", api.handleCheckpoint)
 
@@ -111,8 +120,11 @@ func main() {
 				} else {
 					log.Printf("replication error: %v", err)
 				}
-				stop()
 			}
+			if api.readOnly.Swap(false) {
+				log.Printf("backup mode: promoting to primary")
+			}
+			db.EnableBackgroundCheckpointing(promotionOpts)
 		}()
 	}
 
@@ -137,6 +149,18 @@ func (s *apiServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, okResponse{OK: true})
+}
+
+func (s *apiServer) handleRole(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w, http.MethodGet)
+		return
+	}
+	role := "primary"
+	if s.readOnly.Load() {
+		role = "backup"
+	}
+	writeJSON(w, http.StatusOK, roleResponse{Role: role})
 }
 
 func (s *apiServer) handleKV(w http.ResponseWriter, r *http.Request) {
@@ -177,7 +201,7 @@ func (s *apiServer) handleGet(w http.ResponseWriter, _ *http.Request, key string
 }
 
 func (s *apiServer) handleSet(w http.ResponseWriter, r *http.Request, key string) {
-	if s.readOnly {
+	if s.readOnly.Load() {
 		writeError(w, http.StatusForbidden, errors.New("writes are disabled on backup"))
 		return
 	}
@@ -201,7 +225,7 @@ func (s *apiServer) handleSet(w http.ResponseWriter, r *http.Request, key string
 }
 
 func (s *apiServer) handleDelete(w http.ResponseWriter, _ *http.Request, key string) {
-	if s.readOnly {
+	if s.readOnly.Load() {
 		writeError(w, http.StatusForbidden, errors.New("writes are disabled on backup"))
 		return
 	}
@@ -217,7 +241,7 @@ func (s *apiServer) handleCheckpoint(w http.ResponseWriter, r *http.Request) {
 		writeMethodNotAllowed(w, http.MethodPost)
 		return
 	}
-	if s.readOnly {
+	if s.readOnly.Load() {
 		writeError(w, http.StatusForbidden, errors.New("writes are disabled on backup"))
 		return
 	}

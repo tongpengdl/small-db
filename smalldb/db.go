@@ -468,6 +468,21 @@ func (db *DB) startBackgroundCheckpointing() {
 	go db.backgroundCheckpointLoop()
 }
 
+// EnableBackgroundCheckpointing activates background checkpointing using opts.
+// It is safe to call more than once; subsequent calls are no-ops if already enabled
+// or if opts disable background checkpointing.
+func (db *DB) EnableBackgroundCheckpointing(opts Options) {
+	if db.policy.enabled {
+		return
+	}
+	policy := policyFromOptions(opts)
+	if !policy.enabled {
+		return
+	}
+	db.policy = policy
+	db.startBackgroundCheckpointing()
+}
+
 func (db *DB) stopBackgroundCheckpointing() {
 	if db.bgStop == nil {
 		return

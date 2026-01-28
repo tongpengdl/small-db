@@ -52,6 +52,7 @@ type roleResponse struct {
 func main() {
 	var (
 		addrFlag        = flag.String("addr", ":8080", "listen address")
+		replAddrFlag    = flag.String("repl-addr", ":9090", "replication listen address (primary only)")
 		dirFlag         = flag.String("dir", "", "database directory")
 		createFlag      = flag.Bool("create", false, "create directory if missing")
 		disableBgFlag   = flag.Bool("disable-background-checkpoint", false, "disable background checkpointing")
@@ -106,6 +107,30 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	var replListener net.Listener
+	if *backupOfFlag == "" {
+		ln, err := net.Listen("tcp", *replAddrFlag)
+		if err != nil {
+			log.Fatalf("listen replication %s: %v", *replAddrFlag, err)
+		}
+		replListener = ln
+		log.Printf("replication listener on %s", *replAddrFlag)
+		go func() {
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					if errors.Is(err, net.ErrClosed) {
+						return
+					}
+					log.Printf("replication accept error: %v", err)
+					continue
+				}
+				log.Printf("replication connected from %s", conn.RemoteAddr())
+				db.SetBackupConn(conn)
+			}
+		}()
+	}
+
 	if *backupOfFlag != "" {
 		log.Printf("backup mode: replicating from %s", *backupOfFlag)
 		log.Printf("backup mode: background checkpointing disabled")
@@ -132,6 +157,9 @@ func main() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), *shutdownTimeout)
 		defer cancel()
+		if replListener != nil {
+			_ = replListener.Close()
+		}
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			log.Printf("shutdown error: %v", err)
 		}

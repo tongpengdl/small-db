@@ -58,9 +58,18 @@ for backups.
 
 Basic flow:
 
-- Start a primary normally.
+- Start a primary normally (it will listen for replication on `-repl-addr`,
+  default `:9090`).
 - Copy the primary data directory to the backup before starting it.
-- Start a backup with `-backup-of host:port` and a separate `-dir`.
+- Start a backup with `-backup-of host:port` (the primary's `-repl-addr`) and a
+  separate `-dir`.
+
+Example:
+
+```
+go run ./cmd/small_db_server -dir ./data-primary -create -addr :8080 -repl-addr :9090
+go run ./cmd/small_db_server -dir ./data-backup -create -addr :8081 -backup-of localhost:9090
+```
 
 ### Examples
 

@@ -53,6 +53,8 @@ func main() {
 	var (
 		addrFlag        = flag.String("addr", ":8080", "listen address")
 		replAddrFlag    = flag.String("repl-addr", ":9090", "replication listen address (primary only)")
+		replHBInterval  = flag.Duration("repl-heartbeat-interval", 1*time.Second, "replication heartbeat interval (primary only, 0 disables)")
+		replHBTimeout   = flag.Duration("repl-heartbeat-timeout", 5*time.Second, "replication heartbeat timeout (backup only, 0 disables)")
 		dirFlag         = flag.String("dir", "", "database directory")
 		createFlag      = flag.Bool("create", false, "create directory if missing")
 		disableBgFlag   = flag.Bool("disable-background-checkpoint", false, "disable background checkpointing")
@@ -131,6 +133,27 @@ func main() {
 		}()
 	}
 
+	if *backupOfFlag == "" && *replHBInterval > 0 {
+		go func() {
+			ticker := time.NewTicker(*replHBInterval)
+			defer ticker.Stop()
+			var lastErrLog time.Time
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
+				if err := db.SendHeartbeat(); err != nil {
+					if time.Since(lastErrLog) > 10*time.Second {
+						log.Printf("replication heartbeat error: %v", err)
+						lastErrLog = time.Now()
+					}
+				}
+			}
+		}()
+	}
+
 	if *backupOfFlag != "" {
 		log.Printf("backup mode: replicating from %s", *backupOfFlag)
 		log.Printf("backup mode: background checkpointing disabled")
@@ -139,7 +162,7 @@ func main() {
 			log.Fatalf("dial primary %s: %v", *backupOfFlag, err)
 		}
 		go func() {
-			if err := db.ReceiveReplication(conn); err != nil {
+			if err := db.ReceiveReplication(conn, *replHBTimeout); err != nil {
 				if errors.Is(err, io.EOF) {
 					log.Printf("replication stream closed")
 				} else {

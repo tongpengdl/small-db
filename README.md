@@ -63,6 +63,8 @@ Basic flow:
 - Copy the primary data directory to the backup before starting it.
 - Start a backup with `-backup-of host:port` (the primary's `-repl-addr`) and a
   separate `-dir`.
+- The primary sends periodic heartbeats; the backup promotes if heartbeats stop
+  for longer than the timeout (defaults: 1s interval, 5s timeout).
 
 Example:
 
@@ -70,6 +72,11 @@ Example:
 go run ./cmd/small_db_server -dir ./data-primary -create -addr :8080 -repl-addr :9090
 go run ./cmd/small_db_server -dir ./data-backup -create -addr :8081 -backup-of localhost:9090
 ```
+
+Heartbeat flags:
+
+- `-repl-heartbeat-interval` (primary only): how often to send heartbeats (`0` disables).
+- `-repl-heartbeat-timeout` (backup only): how long to wait before promotion (`0` disables).
 
 ### Examples
 
